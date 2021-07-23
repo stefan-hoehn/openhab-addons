@@ -21,7 +21,6 @@ import java.util.stream.Stream;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
-import org.eclipse.jetty.client.HttpClient;
 import org.openhab.binding.nanoleaf.internal.handler.NanoleafControllerHandler;
 import org.openhab.binding.nanoleaf.internal.handler.NanoleafPanelHandler;
 import org.openhab.core.io.net.http.HttpClientFactory;
@@ -52,11 +51,11 @@ public class NanoleafHandlerFactory extends BaseThingHandlerFactory {
             .unmodifiableSet(Stream.of(THING_TYPE_LIGHT_PANEL, THING_TYPE_CONTROLLER).collect(Collectors.toSet()));
 
     private final Logger logger = LoggerFactory.getLogger(NanoleafHandlerFactory.class);
-    private final HttpClient httpClient;
+    final private HttpClientFactory httpClientFactory;
 
     @Activate
     public NanoleafHandlerFactory(@Reference final HttpClientFactory httpClientFactory) {
-        this.httpClient = httpClientFactory.getCommonHttpClient();
+        this.httpClientFactory = httpClientFactory;
     }
 
     @Override
@@ -69,11 +68,11 @@ public class NanoleafHandlerFactory extends BaseThingHandlerFactory {
         ThingTypeUID thingTypeUID = thing.getThingTypeUID();
 
         if (THING_TYPE_CONTROLLER.equals(thingTypeUID)) {
-            NanoleafControllerHandler handler = new NanoleafControllerHandler((Bridge) thing, httpClient);
+            NanoleafControllerHandler handler = new NanoleafControllerHandler((Bridge) thing, httpClientFactory);
             logger.debug("Nanoleaf controller handler created.");
             return handler;
         } else if (THING_TYPE_LIGHT_PANEL.equals(thingTypeUID)) {
-            NanoleafPanelHandler handler = new NanoleafPanelHandler(thing, httpClient);
+            NanoleafPanelHandler handler = new NanoleafPanelHandler(thing, httpClientFactory);
             logger.debug("Nanoleaf panel handler created.");
             return handler;
         }

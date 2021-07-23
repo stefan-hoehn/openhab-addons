@@ -36,6 +36,7 @@ import org.openhab.binding.nanoleaf.internal.OpenAPIUtils;
 import org.openhab.binding.nanoleaf.internal.config.NanoleafControllerConfig;
 import org.openhab.binding.nanoleaf.internal.model.Effects;
 import org.openhab.binding.nanoleaf.internal.model.Write;
+import org.openhab.core.io.net.http.HttpClientFactory;
 import org.openhab.core.library.types.HSBType;
 import org.openhab.core.library.types.IncreaseDecreaseType;
 import org.openhab.core.library.types.OnOffType;
@@ -81,9 +82,9 @@ public class NanoleafPanelHandler extends BaseThingHandler {
     private @NonNullByDefault({}) ScheduledFuture<?> singleTapJob;
     private @NonNullByDefault({}) ScheduledFuture<?> doubleTapJob;
 
-    public NanoleafPanelHandler(Thing thing, HttpClient httpClient) {
+    public NanoleafPanelHandler(Thing thing, HttpClientFactory httpClientFactory) {
         super(thing);
-        this.httpClient = httpClient;
+        this.httpClient = httpClientFactory.getCommonHttpClient();
     }
 
     @Override
@@ -109,6 +110,7 @@ public class NanoleafPanelHandler extends BaseThingHandler {
         if (controllerStatusInfo.getStatus().equals(ThingStatus.OFFLINE)) {
             initializePanel(new ThingStatusInfo(ThingStatus.OFFLINE, ThingStatusDetail.BRIDGE_OFFLINE,
                     "@text/error.nanoleaf.panel.controllerOffline"));
+
         } else {
             initializePanel(controllerStatusInfo);
         }
@@ -251,7 +253,7 @@ public class NanoleafPanelHandler extends BaseThingHandler {
                 String content = gson.toJson(effects);
                 logger.debug("sending effect command from panel {}: {}", getThing().getUID(), content);
                 setNewRenderedEffectRequest.content(new StringContentProvider(content), "application/json");
-                OpenAPIUtils.sendOpenAPIRequest(setNewRenderedEffectRequest);
+                OpenAPIUtils.sendOpenAPIRequest(httpClient, setNewRenderedEffectRequest);
             } else {
                 logger.warn("Couldn't set rendering effect as Bridge-Handler {} is null", bridge.getUID());
             }
@@ -303,11 +305,11 @@ public class NanoleafPanelHandler extends BaseThingHandler {
                 NanoleafControllerHandler handler = (NanoleafControllerHandler) bridge.getHandler();
                 if (handler != null) {
                     NanoleafControllerConfig config = handler.getControllerConfig();
-                    logger.debug("Sending Request from Panel for getColor()");
+                    logger.debug("Sending Request from Panel {} for getColor()", panelID);
                     Request setPanelUpdateRequest = OpenAPIUtils.requestBuilder(httpClient, config, API_EFFECT,
                             HttpMethod.PUT);
                     setPanelUpdateRequest.content(new StringContentProvider(gson.toJson(effects)), "application/json");
-                    ContentResponse panelData = OpenAPIUtils.sendOpenAPIRequest(setPanelUpdateRequest);
+                    ContentResponse panelData = OpenAPIUtils.sendOpenAPIRequest(httpClient, setPanelUpdateRequest);
                     // parse panel data
 
                     parsePanelData(panelID, config, panelData);
@@ -325,7 +327,9 @@ public class NanoleafPanelHandler extends BaseThingHandler {
                     "@text/error.nanoleaf.panel.communication");
             logger.debug("Panel data could not be retrieved: {}", nue.getMessage());
         }
-
+        if (thing.getStatus().equals(ThingStatus.OFFLINE)) {
+            updateStatus(ThingStatus.ONLINE);
+        }
         return panelInfo.get(panelID);
     }
 

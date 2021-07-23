@@ -15,13 +15,8 @@ package org.openhab.binding.nanoleaf.internal.handler;
 import static org.openhab.binding.nanoleaf.internal.NanoleafBindingConstants.*;
 
 import java.net.URI;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Scanner;
+import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledFuture;
@@ -33,8 +28,6 @@ import org.eclipse.jdt.annotation.Nullable;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.api.ContentResponse;
 import org.eclipse.jetty.client.api.Request;
-import org.eclipse.jetty.client.api.Response;
-import org.eclipse.jetty.client.api.Result;
 import org.eclipse.jetty.client.util.StringContentProvider;
 import org.eclipse.jetty.http.HttpMethod;
 import org.eclipse.jetty.http.HttpStatus;
@@ -45,21 +38,9 @@ import org.openhab.binding.nanoleaf.internal.OpenAPIUtils;
 import org.openhab.binding.nanoleaf.internal.commanddescription.NanoleafCommandDescriptionProvider;
 import org.openhab.binding.nanoleaf.internal.config.NanoleafControllerConfig;
 import org.openhab.binding.nanoleaf.internal.discovery.NanoleafPanelsDiscoveryService;
-import org.openhab.binding.nanoleaf.internal.model.AuthToken;
-import org.openhab.binding.nanoleaf.internal.model.BooleanState;
-import org.openhab.binding.nanoleaf.internal.model.Brightness;
-import org.openhab.binding.nanoleaf.internal.model.ControllerInfo;
-import org.openhab.binding.nanoleaf.internal.model.Ct;
-import org.openhab.binding.nanoleaf.internal.model.Effects;
-import org.openhab.binding.nanoleaf.internal.model.Hue;
-import org.openhab.binding.nanoleaf.internal.model.IntegerState;
-import org.openhab.binding.nanoleaf.internal.model.Layout;
-import org.openhab.binding.nanoleaf.internal.model.On;
-import org.openhab.binding.nanoleaf.internal.model.Rhythm;
-import org.openhab.binding.nanoleaf.internal.model.Sat;
-import org.openhab.binding.nanoleaf.internal.model.State;
-import org.openhab.binding.nanoleaf.internal.model.TouchEvents;
+import org.openhab.binding.nanoleaf.internal.model.*;
 import org.openhab.core.config.core.Configuration;
+import org.openhab.core.io.net.http.HttpClientFactory;
 import org.openhab.core.library.types.DecimalType;
 import org.openhab.core.library.types.HSBType;
 import org.openhab.core.library.types.IncreaseDecreaseType;
@@ -94,15 +75,21 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
 
     // Pairing interval in seconds
     private static final int PAIRING_INTERVAL = 10;
+    private static final int CONNECT_TIMEOUT = 10; // in seconds
 
     private final Logger logger = LoggerFactory.getLogger(NanoleafControllerHandler.class);
+    private HttpClientFactory httpClientFactory;
     private HttpClient httpClient;
+    private @Nullable HttpClient httpClientSSETouchEvent;
+    private @Nullable Request sseTouchjobRequest;
+
     private List<NanoleafControllerListener> controllerListeners = new CopyOnWriteArrayList<>();
 
     // Pairing, update and panel discovery jobs and touch event job
     private @NonNullByDefault({}) ScheduledFuture<?> pairingJob;
     private @NonNullByDefault({}) ScheduledFuture<?> updateJob;
-    private @NonNullByDefault({}) ScheduledFuture<?> touchJob;
+    private @NonNullByDefault({}) ScheduledFuture<?> touchJob; // makes sure that a request for touch event SSE request
+                                                               // is always running
 
     // JSON parser for API responses
     private final Gson gson = new Gson();
@@ -115,9 +102,29 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
     private @Nullable String deviceType;
     private @NonNullByDefault({}) ControllerInfo controllerInfo;
 
-    public NanoleafControllerHandler(Bridge bridge, HttpClient httpClient) {
+    public NanoleafControllerHandler(Bridge bridge, HttpClientFactory httpClientFactory) {
         super(bridge);
-        this.httpClient = httpClient;
+        this.httpClientFactory = httpClientFactory;
+        this.httpClient = httpClientFactory.getCommonHttpClient();
+        httpClient.setConnectTimeout(CONNECT_TIMEOUT * 1000L);
+    }
+
+    private void initializeTouchHttpClient() {
+        String httpClientName = thing.getUID().getId();
+
+        try {
+            httpClientSSETouchEvent = httpClientFactory.createHttpClient(httpClientName);
+            if (httpClientSSETouchEvent != null) {
+                httpClientSSETouchEvent.setConnectTimeout(CONNECT_TIMEOUT * 1000L);
+                httpClientSSETouchEvent.start();
+            }
+        } catch (Exception ex) {
+            logger.error(
+                    "Long running HttpClient for Nanoleaf controller handler {} cannot be started. Creating Handler failed.",
+                    httpClientName);
+            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR, ex.getMessage());
+        }
+        logger.debug("Using long SSE httpClient={} for {}}", httpClientSSETouchEvent, httpClientName);
     }
 
     @Override
@@ -134,6 +141,7 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
         String propertyModelId = properties.get(Thing.PROPERTY_MODEL_ID);
         if (hasTouchSupport(propertyModelId)) {
             config.deviceType = DEVICE_TYPE_TOUCHSUPPORT;
+            initializeTouchHttpClient();
         } else {
             config.deviceType = DEVICE_TYPE_LIGHTPANELS;
         }
@@ -221,7 +229,7 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
             try {
                 Request deleteTokenRequest = OpenAPIUtils.requestBuilder(httpClient, getControllerConfig(),
                         API_DELETE_USER, HttpMethod.DELETE);
-                deleteTokenResponse = OpenAPIUtils.sendOpenAPIRequest(deleteTokenRequest);
+                deleteTokenResponse = OpenAPIUtils.sendOpenAPIRequest(httpClient, deleteTokenRequest);
                 if (deleteTokenResponse.getStatus() != HttpStatus.NO_CONTENT_204) {
                     logger.warn("Failed to delete token for openHAB. Response code is {}",
                             deleteTokenResponse.getStatus());
@@ -272,8 +280,13 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
     }
 
     public String getLayout() {
-        Layout layout = controllerInfo.getPanelLayout().getLayout();
-        String layoutView = (layout != null) ? layout.getLayoutView() : "";
+        String layoutView = "";
+        if (controllerInfo != null) {
+            PanelLayout panelLayout = controllerInfo.getPanelLayout();
+            Layout layout = panelLayout.getLayout();
+            layoutView = (layout != null) ? layout.getLayoutView() : "";
+        }
+
         return layoutView;
     }
 
@@ -285,10 +298,11 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
     }
 
     private synchronized void stopPairingJob() {
+        logger.debug("Stop pairing job {}", (pairingJob != null) ? pairingJob.isCancelled() : "pairing job = null");
         if (pairingJob != null && !pairingJob.isCancelled()) {
-            logger.debug("Stop pairing job");
             pairingJob.cancel(true);
             this.pairingJob = null;
+            logger.debug("Stopped pairing job");
         }
     }
 
@@ -307,44 +321,60 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
     }
 
     private synchronized void stopUpdateJob() {
+        logger.debug("Stop update job {}", (updateJob != null) ? updateJob.isCancelled() : "update job = null");
         if (updateJob != null && !updateJob.isCancelled()) {
-            logger.debug("Stop status job");
             updateJob.cancel(true);
             this.updateJob = null;
+            logger.debug("Stopped status job");
         }
     }
 
     private synchronized void startTouchJob() {
         NanoleafControllerConfig config = getConfigAs(NanoleafControllerConfig.class);
         if (!config.deviceType.equals(DEVICE_TYPE_TOUCHSUPPORT)) {
-            logger.debug("NOT starting TouchJob for Panel {} because it has wrong device type '{}' vs required '{}'",
+            logger.debug(
+                    "NOT starting TouchJob for Controller {} because it has wrong device type '{}' vs required '{}'",
                     this.getThing().getUID(), config.deviceType, DEVICE_TYPE_TOUCHSUPPORT);
             return;
         } else {
-            logger.debug("Starting TouchJob for Panel {}", this.getThing().getUID());
+            logger.debug("Starting TouchJob for Controller {}", this.getThing().getUID());
         }
 
         String localAuthToken = getAuthToken();
         if (localAuthToken != null && !localAuthToken.isEmpty()) {
-            if (touchJob == null || touchJob.isCancelled()) {
-                logger.debug("Starting Touchjob now");
-                touchJob = scheduler.schedule(this::runTouchDetection, 0, TimeUnit.SECONDS);
+            if (touchJob == null || touchJob.isDone()) {
+                logger.debug("tj: Starting NEW touch job : tj={} touchJobRunning={} cancelled={}  done={}", touchJob,
+                        touchJobRunning, (touchJob == null) ? null : touchJob.isCancelled(),
+                        (touchJob == null) ? null : touchJob.isDone());
+                // make sure that we the detect non-running touchjobs very quickly and start them again.
+                touchJob = scheduler.scheduleWithFixedDelay(this::runTouchDetection, 0, 1, TimeUnit.SECONDS);
+            } else {
+                logger.trace("tj: tj={} already running touchJobRunning = {}  cancelled={} done={}", touchJob,
+                        touchJobRunning, (touchJob == null) ? null : touchJob.isCancelled(),
+                        (touchJob == null) ? null : touchJob.isDone());
             }
         } else {
             logger.error("starting TouchJob for Controller {} failed - missing token", this.getThing().getUID());
         }
     }
 
-    private boolean hasTouchSupport(@Nullable String deviceType) {
-        return (MODELS_WITH_TOUCHSUPPORT.contains(deviceType));
+    private synchronized void stopTouchJob() {
+        logger.debug("Stop touch job {}", (touchJob != null) ? touchJob.isCancelled() : "touchJob job = null");
+        if (touchJob != null) {
+            logger.trace("tj: touch job stopping for {} with client {}", thing.getUID(), httpClientSSETouchEvent);
+            sseTouchjobRequest.abort(new NanoleafException("Touch detection stopped"));
+
+            if (!touchJob.isCancelled()) {
+                touchJob.cancel(true);
+            }
+            this.touchJob = null;
+            touchJobRunning = false;
+            logger.debug("tj: touch job stopped for {} with client {}", thing.getUID(), httpClientSSETouchEvent);
+        }
     }
 
-    private synchronized void stopTouchJob() {
-        if (touchJob != null && !touchJob.isCancelled()) {
-            logger.debug("Stop touch job");
-            touchJob.cancel(true);
-            this.touchJob = null;
-        }
+    private boolean hasTouchSupport(@Nullable String deviceType) {
+        return (MODELS_WITH_TOUCHSUPPORT.contains(deviceType));
     }
 
     private void runUpdate() {
@@ -354,7 +384,7 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
             startTouchJob(); // if device type has changed, start touch detection.
             updateStatus(ThingStatus.ONLINE);
         } catch (NanoleafUnauthorizedException nae) {
-            logger.warn("Status update unauthorized: {}", nae.getMessage());
+            logger.warn("Status update unauthorized for controller {}: {}", getThing().getUID(), nae.getMessage());
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
                     "@text/error.nanoleaf.controller.invalidToken");
             String localAuthToken = getAuthToken();
@@ -363,7 +393,7 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
                         "@text/error.nanoleaf.controller.noToken");
             }
         } catch (NanoleafException ne) {
-            logger.warn("Status update failed: {}", ne.getMessage());
+            logger.warn("Status update failed for controller {} : {}", getThing().getUID(), ne.getMessage());
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
                     "@text/error.nanoleaf.controller.communication");
         } catch (RuntimeException e) {
@@ -442,66 +472,81 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
 
     /**
      * This is based on the touch event detection described in https://forum.nanoleaf.me/docs/openapi#_842h3097vbgq
+     *
+     * Normally the Server-Side-Event Request should run forever. However, in the case of the device going down
+     * the request would sit there forever and it is not being detected as the request would not end even if the
+     * connection to the device is broken.
+     * Therefore we let the request timeout after 10 seconds in case no touch is received (no content) and then
+     * quickly reschedule it. This makes the connective much more resilient as we regulary initiate a new request
+     * to a device.
      */
-    private static boolean touchJobRunning = false;
+    private boolean touchJobRunning = false;
 
-    private void runTouchDetection() {
+    synchronized private void runTouchDetection() {
         if (touchJobRunning) {
-            logger.debug("touch job already running. quitting.");
+            logger.trace("tj: touch job {} touch job already running. quitting. {} controller {} with {}\",\n",
+                    touchJob, httpClientSSETouchEvent.hashCode(), thing.getUID(), httpClientSSETouchEvent);
             return;
         }
         try {
-            touchJobRunning = true;
             URI eventUri = OpenAPIUtils.getUri(getControllerConfig(), API_EVENTS, "id=4");
-            logger.debug("touch job registered on: {}", eventUri.toString());
-            httpClient.newRequest(eventUri).send(new Response.Listener.Adapter() // request runs forever
-            {
-                @Override
-                public void onContent(@Nullable Response response, @Nullable ByteBuffer content) {
-                    String s = StandardCharsets.UTF_8.decode(content).toString();
-                    logger.trace("content {}", s);
+            logger.debug("tj: touch job request registering for {} with client {}", thing.getUID(),
+                    httpClientSSETouchEvent);
 
-                    Scanner eventContent = new Scanner(s);
-                    while (eventContent.hasNextLine()) {
-                        String line = eventContent.nextLine().trim();
-                        // we don't expect anything than content id:4, so we do not check that but only care about the
-                        // data part
-                        if (line.startsWith("data:")) {
-                            String json = line.substring(5).trim(); // supposed to be JSON
-                            try {
-                                TouchEvents touchEvents = gson.fromJson(json, TouchEvents.class);
-                                handleTouchEvents(Objects.requireNonNull(touchEvents));
-                            } catch (JsonSyntaxException jse) {
-                                logger.error("couldn't parse touch event json {}", json);
-                            }
+            // however, it may fail if the nanoleaf controller cannot be reached anymore
+            // in this case it will timeout and needs to be restarted eventually via the scheduler
+            touchJobRunning = true;
+            httpClientSSETouchEvent.setIdleTimeout(CONNECT_TIMEOUT * 1000L); //
+
+            sseTouchjobRequest = httpClientSSETouchEvent.newRequest(eventUri);
+            logger.debug("tj: triggering new touch job request {} for {} with client {}", sseTouchjobRequest.hashCode(),
+                    thing.getUID(), httpClientSSETouchEvent.hashCode());
+
+            sseTouchjobRequest.onResponseContent((response, content) -> {
+                String s = StandardCharsets.UTF_8.decode(content).toString();
+                logger.debug("touch detected for controller {}", thing.getUID());
+                logger.trace("content {}", s);
+
+                Scanner eventContent = new Scanner(s);
+                while (eventContent.hasNextLine()) {
+                    String line = eventContent.nextLine().trim();
+                    // we don't expect anything than content id:4, so we do not check that but only care about the
+                    // data part
+                    if (line.startsWith("data:")) {
+                        String json = line.substring(5).trim(); // supposed to be JSON
+                        try {
+                            TouchEvents touchEvents = gson.fromJson(json, TouchEvents.class);
+                            handleTouchEvents(Objects.requireNonNull(touchEvents));
+                        } catch (JsonSyntaxException jse) {
+                            logger.error("couldn't parse touch event json {}", json);
                         }
                     }
-                    eventContent.close();
-                    logger.debug("leaving touch onContent");
-                    super.onContent(response, content);
                 }
+                eventContent.close();
+                logger.debug("leaving touch onContent");
+            }).onResponseSuccess(response -> {
+                logger.trace("tj: r={} touch event SUCCESS: {}", response.getRequest(), response);
+            }).onResponseFailure((response, failure) -> {
+                logger.trace("tj: r={} touch event FAILURE. Touchjob not running anymore for controller {}",
+                        response.getRequest(), thing.getUID());
+            }).send((result) -> {
 
-                @Override
-                public void onSuccess(@Nullable Response response) {
-                    logger.trace("touch event SUCCESS: {}", response);
-                }
-
-                @Override
-                public void onFailure(@Nullable Response response, @Nullable Throwable failure) {
-                    logger.trace("touch event FAILURE: {}", response);
-                }
-
-                @Override
-                public void onComplete(@Nullable Result result) {
-                    logger.trace("touch event COMPLETE: {}", result);
-                }
+                logger.trace(
+                        "tj: r={} touch event COMPLETE. Touchjob not running anymore for controller {}      failed: {}        succeeded: {}",
+                        result.getRequest(), thing.getUID(), result.isFailed(), result.isSucceeded());
+                touchJobRunning = false; // make sure the request is restarted asap
             });
+
+            logger.trace("tj: started touch job request for {} with {} at {}", thing.getUID(), httpClientSSETouchEvent,
+                    eventUri.toString());
         } catch (RuntimeException | NanoleafException e) {
-            logger.warn("setting up TouchDetection failed", e);
+            logger.warn("tj: setting up TouchDetection failed for controller {} with {}\",\n", thing.getUID(),
+                    httpClientSSETouchEvent);
+            logger.warn("tj: setting up TouchDetection failed with exception", e);
         } finally {
-            touchJobRunning = false;
+            logger.trace("tj: touch job {} started for new request {} controller {} with {}\",\n", touchJob.hashCode(),
+                    httpClientSSETouchEvent.hashCode(), thing.getUID(), httpClientSSETouchEvent);
         }
-        logger.debug("leaving run touch detection");
     }
 
     /**
@@ -617,8 +662,8 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
     }
 
     private ControllerInfo receiveControllerInfo() throws NanoleafException, NanoleafUnauthorizedException {
-        ContentResponse controllerlInfoJSON = OpenAPIUtils.sendOpenAPIRequest(OpenAPIUtils.requestBuilder(httpClient,
-                getControllerConfig(), API_GET_CONTROLLER_INFO, HttpMethod.GET));
+        ContentResponse controllerlInfoJSON = OpenAPIUtils.sendOpenAPIRequest(httpClient, OpenAPIUtils
+                .requestBuilder(httpClient, getControllerConfig(), API_GET_CONTROLLER_INFO, HttpMethod.GET));
         ControllerInfo controllerInfo = gson.fromJson(controllerlInfoJSON.getContentAsString(), ControllerInfo.class);
         return Objects.requireNonNull(controllerInfo);
     }
@@ -729,7 +774,7 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
         Request setNewStateRequest = OpenAPIUtils.requestBuilder(httpClient, getControllerConfig(), API_SET_VALUE,
                 HttpMethod.PUT);
         setNewStateRequest.content(new StringContentProvider(gson.toJson(stateObject)), "application/json");
-        OpenAPIUtils.sendOpenAPIRequest(setNewStateRequest);
+        OpenAPIUtils.sendOpenAPIRequest(httpClient, setNewStateRequest);
     }
 
     private void sendEffectCommand(Command command) throws NanoleafException {
@@ -743,9 +788,9 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
         Request setNewEffectRequest = OpenAPIUtils.requestBuilder(httpClient, getControllerConfig(), API_EFFECT,
                 HttpMethod.PUT);
         String content = gson.toJson(effects);
-        logger.debug("sending effect command from controller {}: {}", getThing().getUID(), content);
+        logger.info("sending effect command from controller {}: {}", getThing().getUID(), content);
         setNewEffectRequest.content(new StringContentProvider(content), "application/json");
-        OpenAPIUtils.sendOpenAPIRequest(setNewEffectRequest);
+        OpenAPIUtils.sendOpenAPIRequest(httpClient, setNewEffectRequest);
     }
 
     private void sendRhythmCommand(Command command) throws NanoleafException {
@@ -759,7 +804,7 @@ public class NanoleafControllerHandler extends BaseBridgeHandler {
         Request setNewRhythmRequest = OpenAPIUtils.requestBuilder(httpClient, getControllerConfig(), API_RHYTHM_MODE,
                 HttpMethod.PUT);
         setNewRhythmRequest.content(new StringContentProvider(gson.toJson(rhythm)), "application/json");
-        OpenAPIUtils.sendOpenAPIRequest(setNewRhythmRequest);
+        OpenAPIUtils.sendOpenAPIRequest(httpClient, setNewRhythmRequest);
     }
 
     private @Nullable String getAddress() {

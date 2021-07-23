@@ -77,6 +77,7 @@ For canvas that use square panels, you can request the layout through a console 
 ```
 openhab:nanoleaf layout [<thingUID>]
 ```
+
 The `thingUID` is an optional parameter. If it is not provided, the command loops through all Nanoleaf controller things it can find and prints the layout for each of them.
 
 Compare the following output with the right picture at the beginning of the article

@@ -15,7 +15,6 @@ package org.openhab.binding.nanoleaf.internal.commanddescription;
 import java.util.List;
 import java.util.stream.Collectors;
 
-import org.eclipse.jdt.annotation.NonNull;
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
 import org.openhab.binding.nanoleaf.internal.NanoleafBindingConstants;
@@ -67,11 +66,11 @@ public class NanoleafCommandDescriptionProvider extends BaseDynamicCommandDescri
     }
 
     @Override
-    public void onControllerInfoFetched(@NonNull ThingUID bridge, @NonNull ControllerInfo controllerInfo) {
-        List<@NonNull String> effects = controllerInfo.getEffects().getEffectsList();
+    public void onControllerInfoFetched(ThingUID bridge, ControllerInfo controllerInfo) {
+        List<String> effects = controllerInfo.getEffects().getEffectsList();
         ChannelUID uid = effectChannelUID;
         if (effects != null && uid != null && uid.getThingUID().equals(bridge)) {
-            List<@NonNull CommandOption> commandOptions = effects.stream() //
+            List<CommandOption> commandOptions = effects.stream() //
                     .map(effect -> new CommandOption(effect, effect)) //
                     .collect(Collectors.toList());
             setCommandOptions(uid, commandOptions);

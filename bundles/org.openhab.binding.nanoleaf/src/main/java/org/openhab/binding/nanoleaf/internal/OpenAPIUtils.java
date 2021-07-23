@@ -42,6 +42,7 @@ import org.slf4j.LoggerFactory;
  * The {@link OpenAPIUtils} offers helper methods to support API communication with the controller
  *
  * @author Martin Raepple - Initial contribution
+ * @author Stefan Höhn - further development
  */
 @NonNullByDefault
 public class OpenAPIUtils {
@@ -55,8 +56,8 @@ public class OpenAPIUtils {
     public static Request requestBuilder(HttpClient httpClient, NanoleafControllerConfig controllerConfig,
             String apiOperation, HttpMethod method) throws NanoleafException {
         URI requestURI = getUri(controllerConfig, apiOperation, null);
-        LOGGER.trace("RequestBuilder: Sending Request {}:{} {} ", requestURI.getHost(), requestURI.getPort(),
-                requestURI.getPath());
+        LOGGER.trace("RequestBuilder: Sending Request {}:{} {} \n op: {}  method: {}", requestURI.getHost(),
+                requestURI.getPort(), requestURI.getPath(), apiOperation, method.toString());
 
         return httpClient.newRequest(requestURI).method(method).timeout(10, TimeUnit.SECONDS);
     }
@@ -89,7 +90,7 @@ public class OpenAPIUtils {
         return requestURI;
     }
 
-    public static ContentResponse sendOpenAPIRequest(Request request) throws NanoleafException {
+    public static ContentResponse sendOpenAPIRequest(HttpClient httpClient, Request request) throws NanoleafException {
         try {
             traceSendRequest(request);
             ContentResponse openAPIResponse;
@@ -115,18 +116,45 @@ public class OpenAPIUtils {
                             openAPIResponse.getStatus()));
                 }
             }
-        } catch (ExecutionException | TimeoutException clientException) {
+        } catch (ExecutionException clientException) {
             if (clientException.getCause() instanceof HttpResponseException
                     && ((HttpResponseException) clientException.getCause()).getResponse()
                             .getStatus() == HttpStatus.UNAUTHORIZED_401) {
                 LOGGER.warn("OpenAPI request unauthorized. Invalid authorization token.");
                 throw new NanoleafUnauthorizedException("Invalid authorization token");
+            } else {
+                throw new NanoleafException("Failed to send OpenAPI request (final)", clientException);
             }
-            throw new NanoleafException("Failed to send OpenAPI request", clientException);
+        } catch (TimeoutException timeoutException) {
+            // note that this is seldomly happening but if it does, this makes the binding completely stable
+            // https://community.openhab.org/t/solved-httpclient-keeps-failing-get-request-after-onqueued-with-timeout/118320
+            LOGGER.warn("OpenAPI request failed with timeout", timeoutException);
+            // restartHttpClient(httpClient, clientException);
+            throw new NanoleafException("Failed to send OpenAPI request: Timeout", timeoutException);
         } catch (InterruptedException interruptedException) {
             throw new NanoleafInterruptedException("OpenAPI request has been interrupted", interruptedException);
         }
     }
+
+    /*
+     * private static void restartHttpClient(HttpClient httpClient, Exception clientException) throws NanoleafException
+     * {
+     * try {
+     * LOGGER.trace("httpclient= {} running={} blocking={} failed={} stopped={}, stopping= {}", httpClient,
+     * httpClient.isRunning(), httpClient.isConnectBlocking(), httpClient.isFailed(),
+     * httpClient.isStopped(), httpClient.isStopping());
+     * 
+     * LOGGER.warn("restarting httpClient");
+     * httpClient.stop();
+     * httpClient.start();
+     * 
+     * LOGGER.error("HTTP Client restarted. Original-Exception=", clientException);
+     * } catch (Exception restartException) {
+     * LOGGER.warn("OpenAPI request failed. Couldn't restart httpClient: ", restartException);
+     * throw new NanoleafException("Failed to send OpenAPI request: Timeout", clientException);
+     * }
+     * }
+     */
 
     private static void traceSendRequest(Request request) {
         if (!LOGGER.isTraceEnabled()) {
